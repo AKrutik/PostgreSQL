@@ -1,0 +1,84 @@
+#!/bin/bash
+rep_user="replica"
+witnessIp=192.168.0.106
+#primaryIp=192.168.0.105
+#standbyIp=192.168.0.107
+# Read IP address
+read -p "Enter primary ip: " primaryIp
+read -p "Enter standby ip: " standbyIp
+ssh root@$primaryIp << EOT
+echo "Connect to primary server"
+systemctl enable postgresql
+echo "Change postgresql.conf"
+sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/; s/#wal_level = replica/wal_level = replica/; s/#synchronous_commit = on/synchronous_commit = on/; s/#max_wal_senders = 10/max_wal_senders = 10/; s/#wal_keep_segments = 0/wal_keep_segments = 10/; s/#synchronous_standby_names = ''/synchronous_standby_names = '*'/" /etc/postgresql/12/main/postgresql.conf
+echo "Add rull to pg_sql.conf"
+if grep -Fxq 'host replication $rep_user $standbyIp/32 trust' /etc/postgresql/12/main/pg_hba.conf
+then echo 'Rule exist'
+else echo 'host replication $rep_user $standbyIp/32 trust' >> /etc/postgresql/12/main/pg_hba.conf
+fi
+if grep -Fxq 'host all all 0.0.0.0/0 md5' /etc/postgresql/12/main/pg_hba.conf
+then echo 'Rule exist'
+else echo 'host all all 0.0.0.0/0 md5' >> /etc/postgresql/12/main/pg_hba.conf
+fi
+echo "Create $rep_user"
+sudo -S -u postgres psql -c "CREATE USER $rep_user REPLICATION PASSWORD 'A';"
+systemctl restart postgresql
+EOT
+echo "Primary server finished"
+
+ssh root@$standbyIp << EOT
+echo "Connect to standby server"
+apt update
+apt upgrade -y
+apt install -y postgresql
+systemctl enable postgresql
+echo "Posstgresql installed"
+systemctl stop postgresql
+rm -rf /var/lib/postgresql/12/main/
+sudo -S -u postgres pg_basebackup -R -h $primaryIp -U $rep_user -D /var/lib/postgresql/12/main -P -w
+echo "Backup is succsessful"
+sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/; s/#hot_standby = on/hot_standby = on/" /etc/postgresql/12/main/postgresql.conf
+echo "Changed postgresql.conf"
+if grep -Fxq 'host all all 0.0.0.0/0 md5' /etc/postgresql/12/main/pg_hba.conf
+then echo 'Rule exist'
+else echo 'host all all 0.0.0.0/0 md5' >> /etc/postgresql/12/main/pg_hba.conf
+fi
+systemctl start postgresql
+echo "Create agent"
+cat > /etc/init.d/script << AUF
+#!/bin/bash
+while true
+do
+	if pg_isready -h $primaryIp -q
+	then
+		echo "Primary is available"
+	else
+		if ping -c 1 -q $witnessIp
+		then
+			wall "Primary is not available. Promote StandbyIp"
+			sudo -S -u postgres psql -c "SELECT pg_promote(false);"
+			break;
+		else
+			wall "Primary and witness is not available"
+		fi
+	fi
+	sleep 1
+done
+wall "final"
+AUF
+cat > /etc/systemd/system//script.service << AUF
+[Unit]
+Description=My service
+After=network.target
+[Service]
+Type=oneshot
+User=root
+ExecStart=/etc/init.d/script
+[Install]
+WantedBy=multi-user.target
+AUF
+chmod +x /etc/init.d/script 
+systemctl enable script.service
+systemctl restart script.service
+EOT
+echo "StandBy server finished"
